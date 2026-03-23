@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+anthropic
+curl-cffi
+python-dotenv
+rich
