@@ -4,3 +4,4 @@ anthropic
 curl-cffi
 python-dotenv
 rich
+psycopg2-binary

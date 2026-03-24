@@ -23,7 +23,8 @@ import os
 import re
 import json
 import logging
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timedelta
 
 import anthropic
@@ -54,43 +55,47 @@ if not SLACK_WEBHOOK_URL:
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-DB_PATH = os.getenv("DB_PATH", "leads.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
 
 def _db():
-    """Return a thread-local SQLite connection."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """Return a new Postgres connection."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 
 def init_db():
     """Create the leads table if it doesn't exist."""
-    with _db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS leads (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                address_raw     TEXT,
-                address_norm    TEXT,
-                zpid            TEXT,
-                name            TEXT,
-                source          TEXT,
-                zestimate       REAL,
-                last_sold_price REAL,
-                last_sold_date  TEXT,
-                flag_count      INTEGER,
-                flags_hit       TEXT,
-                slack_sent      INTEGER DEFAULT 0,
-                processed_at    TEXT,
-                lead_raw        TEXT,
-                prop_raw        TEXT
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_address_norm ON leads(address_norm)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_zpid ON leads(zpid)")
+    conn = _db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS leads (
+                    id              SERIAL PRIMARY KEY,
+                    address_raw     TEXT,
+                    address_norm    TEXT,
+                    zpid            TEXT,
+                    name            TEXT,
+                    source          TEXT,
+                    zestimate       REAL,
+                    last_sold_price REAL,
+                    last_sold_date  TEXT,
+                    flag_count      INTEGER,
+                    flags_hit       TEXT,
+                    slack_sent      INTEGER DEFAULT 0,
+                    processed_at    TEXT,
+                    lead_raw        TEXT,
+                    prop_raw        TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_address_norm ON leads(address_norm)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_zpid ON leads(zpid)")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _norm_address(address: str) -> str:
@@ -107,48 +112,59 @@ def is_duplicate(address: str, zpid: str = None) -> dict | None:
     otherwise return None.
     """
     norm = _norm_address(address)
-    with _db() as conn:
-        if zpid:
-            row = conn.execute(
-                "SELECT * FROM leads WHERE zpid = ? ORDER BY processed_at DESC LIMIT 1",
-                (zpid,)
-            ).fetchone()
-            if row:
-                return dict(row)
-        row = conn.execute(
-            "SELECT * FROM leads WHERE address_norm = ? ORDER BY processed_at DESC LIMIT 1",
-            (norm,)
-        ).fetchone()
-        return dict(row) if row else None
+    conn = _db()
+    try:
+        with conn.cursor() as cur:
+            if zpid:
+                cur.execute(
+                    "SELECT * FROM leads WHERE zpid = %s ORDER BY processed_at DESC LIMIT 1",
+                    (zpid,)
+                )
+                row = cur.fetchone()
+                if row:
+                    return dict(row)
+            cur.execute(
+                "SELECT * FROM leads WHERE address_norm = %s ORDER BY processed_at DESC LIMIT 1",
+                (norm,)
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def record_lead(lead: dict, prop: dict, analysis: dict, slack_sent: bool):
     """Persist a processed lead to the database."""
     flags_hit = analysis.get("flags_hit", [])
-    with _db() as conn:
-        conn.execute("""
-            INSERT INTO leads
-                (address_raw, address_norm, zpid, name, source,
-                 zestimate, last_sold_price, last_sold_date,
-                 flag_count, flags_hit, slack_sent, processed_at,
-                 lead_raw, prop_raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            lead.get("address", ""),
-            _norm_address(lead.get("address", "")),
-            prop.get("zpid"),
-            lead.get("name") or (lead.get("first_name","") + " " + lead.get("last_name","")).strip(),
-            lead.get("source", ""),
-            prop.get("zestimate"),
-            prop.get("last_sold_price"),
-            prop.get("last_sold_date"),
-            analysis.get("flag_count", 0),
-            json.dumps(flags_hit),
-            int(slack_sent),
-            datetime.now().isoformat(),
-            json.dumps(lead),
-            json.dumps({k: v for k, v in prop.items() if isinstance(v, (str, int, float, bool, type(None)))}),
-        ))
+    conn = _db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO leads
+                    (address_raw, address_norm, zpid, name, source,
+                     zestimate, last_sold_price, last_sold_date,
+                     flag_count, flags_hit, slack_sent, processed_at,
+                     lead_raw, prop_raw)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                lead.get("address", ""),
+                _norm_address(lead.get("address", "")),
+                prop.get("zpid"),
+                lead.get("name") or (lead.get("first_name","") + " " + lead.get("last_name","")).strip(),
+                lead.get("source", ""),
+                prop.get("zestimate"),
+                prop.get("last_sold_price"),
+                prop.get("last_sold_date"),
+                analysis.get("flag_count", 0),
+                json.dumps(flags_hit),
+                int(slack_sent),
+                datetime.now().isoformat(),
+                json.dumps(lead),
+                json.dumps({k: v for k, v in prop.items() if isinstance(v, (str, int, float, bool, type(None)))}),
+            ))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 init_db()
@@ -962,16 +978,21 @@ def health():
 @app.get("/api/leads")
 def api_leads(limit: int = 50, slack_sent: int = None, min_flags: int = 0):
     """Query processed leads from the database."""
-    query  = "SELECT * FROM leads WHERE flag_count >= ?"
+    query  = "SELECT * FROM leads WHERE flag_count >= %s"
     params = [min_flags]
     if slack_sent is not None:
-        query  += " AND slack_sent = ?"
+        query  += " AND slack_sent = %s"
         params.append(slack_sent)
-    query += " ORDER BY processed_at DESC LIMIT ?"
+    query += " ORDER BY processed_at DESC LIMIT %s"
     params.append(limit)
-    with _db() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    conn = _db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 @app.post("/webhook/lead")
