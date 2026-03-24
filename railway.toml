@@ -1,0 +1,6 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python lead_bot.py"
+restartPolicyType = "on_failure"
