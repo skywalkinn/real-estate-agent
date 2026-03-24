@@ -656,7 +656,13 @@ def analyze_lead(lead: dict, prop: dict) -> dict:
 
     prompt = f"""You are summarizing the listing history of a property for a real estate investment team.
 
-State only the facts from the listing history below — dates, prices, and events. No interpretation, no commentary, no conclusions. 2-3 sentences max. If there is no meaningful listing history, say so in one sentence.
+Rules:
+- For any listing or sale activity within the last 5 years: include specific dates, prices, and events.
+- For activity older than 5 years: mention it briefly in general terms only (e.g. "listed in 2015 but did not sell") — no specific prices or amounts.
+- No interpretation, no commentary, no conclusions. Facts only. 2-3 sentences max.
+- If there is no meaningful listing history, say so in one sentence.
+
+Today's year: {datetime.now().year}
 
 LISTING HISTORY (newest first):
 {history_lines}
