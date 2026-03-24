@@ -747,13 +747,18 @@ def send_slack(lead: dict, prop: dict, analysis: dict, zillow_link: str):
         addr_line += f"  •  Zestimate: *${zest:,.0f}*"
     detail_lines.append(addr_line)
 
-    # Beds / baths / sqft / lot / year
+    # Beds / baths / sqft / lot / year / type
     beds       = prop.get("beds")
     baths      = prop.get("baths")
     sqft       = prop.get("sqft")
     year_built = prop.get("year_built")
     lot_size   = prop.get("lot_size")
+    raw_type   = prop.get("home_type") or prop.get("property_type") or ""
+    # Clean up CamelCase → readable (e.g. SingleFamily → Single Family)
+    import re as _re
+    home_type_str = _re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', raw_type).replace("_", " ").strip()
     parts = []
+    if home_type_str: parts.append(home_type_str)
     parts.append(f"{int(beds)} bd" if beds is not None else "-- bd")
     parts.append(f"{baths:.1g} ba" if baths is not None else "-- ba")
     if sqft:     parts.append(f"{int(sqft):,} sqft")
