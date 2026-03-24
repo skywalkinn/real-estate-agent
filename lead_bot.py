@@ -23,6 +23,7 @@ import os
 import re
 import json
 import logging
+import sqlite3
 from datetime import datetime, timedelta
 
 import anthropic
@@ -32,7 +33,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
-load_dotenv()
+load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -52,6 +53,105 @@ if not SLACK_WEBHOOK_URL:
     raise RuntimeError("SLACK_WEBHOOK_URL is not set in .env")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+DB_PATH = os.getenv("DB_PATH", "leads.db")
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def _db():
+    """Return a thread-local SQLite connection."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """Create the leads table if it doesn't exist."""
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                address_raw     TEXT,
+                address_norm    TEXT,
+                zpid            TEXT,
+                name            TEXT,
+                source          TEXT,
+                zestimate       REAL,
+                last_sold_price REAL,
+                last_sold_date  TEXT,
+                flag_count      INTEGER,
+                flags_hit       TEXT,
+                slack_sent      INTEGER DEFAULT 0,
+                processed_at    TEXT,
+                lead_raw        TEXT,
+                prop_raw        TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_address_norm ON leads(address_norm)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_zpid ON leads(zpid)")
+
+
+def _norm_address(address: str) -> str:
+    """Normalize an address for dedup comparison."""
+    a = address.lower().strip()
+    a = re.sub(r'[^a-z0-9\s]', '', a)
+    a = re.sub(r'\s+', ' ', a)
+    return a
+
+
+def is_duplicate(address: str, zpid: str = None) -> dict | None:
+    """
+    Return the existing lead row if this address/zpid was already processed,
+    otherwise return None.
+    """
+    norm = _norm_address(address)
+    with _db() as conn:
+        if zpid:
+            row = conn.execute(
+                "SELECT * FROM leads WHERE zpid = ? ORDER BY processed_at DESC LIMIT 1",
+                (zpid,)
+            ).fetchone()
+            if row:
+                return dict(row)
+        row = conn.execute(
+            "SELECT * FROM leads WHERE address_norm = ? ORDER BY processed_at DESC LIMIT 1",
+            (norm,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def record_lead(lead: dict, prop: dict, analysis: dict, slack_sent: bool):
+    """Persist a processed lead to the database."""
+    flags_hit = analysis.get("flags_hit", [])
+    with _db() as conn:
+        conn.execute("""
+            INSERT INTO leads
+                (address_raw, address_norm, zpid, name, source,
+                 zestimate, last_sold_price, last_sold_date,
+                 flag_count, flags_hit, slack_sent, processed_at,
+                 lead_raw, prop_raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            lead.get("address", ""),
+            _norm_address(lead.get("address", "")),
+            prop.get("zpid"),
+            lead.get("name") or (lead.get("first_name","") + " " + lead.get("last_name","")).strip(),
+            lead.get("source", ""),
+            prop.get("zestimate"),
+            prop.get("last_sold_price"),
+            prop.get("last_sold_date"),
+            analysis.get("flag_count", 0),
+            json.dumps(flags_hit),
+            int(slack_sent),
+            datetime.now().isoformat(),
+            json.dumps(lead),
+            json.dumps({k: v for k, v in prop.items() if isinstance(v, (str, int, float, bool, type(None)))}),
+        ))
+
+
+init_db()
 
 REDFIN_HEADERS = {
     "User-Agent": (
@@ -378,6 +478,7 @@ def zillow_lookup(address: str) -> dict:
     status        = prop.get("homeStatus") or prop.get("homeStatusForHDP") or ""
     photos        = prop.get("photos") or prop.get("originalPhotos") or []
     price_history = prop.get("priceHistory") or []
+    reso          = prop.get("resoFacts") or {}
 
     # Build canonical Zillow URL
     url_path = prop.get("hdpUrl") or prop.get("url") or ""
@@ -421,15 +522,48 @@ def zillow_lookup(address: str) -> dict:
         if lsp:
             last_sold_price = float(lsp)
 
+    rent_zestimate = prop.get("rentZestimate")
+    lot_size       = reso.get("lotSize") or prop.get("lotAreaValue") or prop.get("lotSize")
+    lot_units      = prop.get("lotAreaUnits") or ""
+    home_type      = prop.get("homeType") or prop.get("propertyTypeDimension") or ""
+    hoa_fee        = prop.get("monthlyHoaFee") or prop.get("hoaFee")
+    days_on_zillow = prop.get("daysOnZillow")
+    raw_photo_url  = prop.get("desktopWebHdpImageLink") or ""
+    photo_url      = raw_photo_url
+
+    # Garage
+    has_garage       = reso.get("hasGarage") or reso.get("hasAttachedGarage")
+    parking_features = reso.get("parkingFeatures") or []
+    garage_capacity  = reso.get("garageParkingCapacity")
+    if not has_garage and parking_features:
+        has_garage = any("garage" in f.lower() for f in parking_features)
+    garage_str = None
+    if has_garage:
+        cap = f" ({int(garage_capacity)}-car)" if garage_capacity else ""
+        attached = any("attached" in f.lower() for f in parking_features)
+        garage_str = f"Garage{cap}" + (" – Attached" if attached else "")
+
+    # Basement
+    basement_raw = reso.get("basement") or reso.get("basementYN")
+    basement_str = None
+    if basement_raw and str(basement_raw).lower() not in ("none", "false", "0", ""):
+        basement_str = basement_raw if isinstance(basement_raw, str) else "Yes"
+
     result.update({
         "source":                 "zillow",
         "zpid":                   zpid,
         "zestimate":              float(zestimate) if zestimate else None,
+        "rent_zestimate":         float(rent_zestimate) if rent_zestimate else None,
         "price":                  float(price) if price else None,
         "beds":                   prop.get("bedrooms"),
         "baths":                  prop.get("bathrooms"),
         "sqft":                   prop.get("livingArea"),
+        "lot_size":               str(lot_size) if lot_size else None,
+        "lot_units":              lot_units,
         "year_built":             prop.get("yearBuilt"),
+        "home_type":              home_type,
+        "hoa_fee":                float(hoa_fee) if hoa_fee else None,
+        "days_on_zillow":         int(days_on_zillow) if days_on_zillow else None,
         "mls_status":             status,
         "has_photos":             bool(photos) or bool(url_path),
         "photo_count":            len(photos) if isinstance(photos, list) else 0,
@@ -441,6 +575,11 @@ def zillow_lookup(address: str) -> dict:
                                       "PENDING", "COMING_SOON",
                                   ),
         "display_name":           addr_data.get("streetAddress", street),
+        "photo_url":              photo_url,
+        "garage":                 garage_str,
+        "basement":               basement_str,
+        "lot_size":               str(lot_size) if lot_size else None,
+        "price_history":          price_history,
     })
     log.info(
         "Scrapeak/Zillow found: zpid=%s status=%s zestimate=%s last_sold=%s photos=%s",
@@ -464,6 +603,15 @@ def analyze_lead(lead: dict, prop: dict) -> dict:
     estimate = prop.get("redfin_estimate") or prop.get("zestimate")
     value    = price or estimate or 0
 
+    year_built      = prop.get("year_built")
+    last_sold_price = prop.get("last_sold_price")
+    zestimate       = prop.get("zestimate") or prop.get("redfin_estimate")
+    low_equity      = False
+    high_equity     = False
+    if last_sold_price and zestimate and zestimate > 0:
+        low_equity  = abs(zestimate - last_sold_price) / zestimate <= 0.20
+        high_equity = last_sold_price <= zestimate * 0.50
+
     flags = {
         "active_mls_listing":        bool(prop.get("mls_status", "").lower() in
                                           ("active", "for sale", "coming soon", "active under contract",
@@ -473,25 +621,32 @@ def analyze_lead(lead: dict, prop: dict) -> dict:
         "listing_photos_available":  (prop.get("photo_count") or 0) > 1,
         "sold_within_36_months":     bool(prop.get("last_sold_within_36mo")),
         "listed_or_expired_36mo":    bool(prop.get("listed_or_expired_36mo")),
+        "newer_build":               bool(year_built and int(year_built) >= 1990),
+        "low_equity":                low_equity,
+        "high_equity":               high_equity,
         "unknown_bed_count":         prop.get("beds") is None,
     }
     flags_hit = [k for k, v in flags.items() if v]
 
-    prompt = f"""You are reviewing a real estate lead before initial outreach. Write a brief 2-3 sentence summary of what the property data shows. Just the facts — no scoring, no verdict, no recommendations. Focus on anything that's useful to know before making the first call. Do NOT mention obvious equity or value comparisons (e.g. "the property has gained equity since purchase" or "current value exceeds last sale price") — that is assumed and adds no value.
+    # Format price history for the prompt
+    history = prop.get("price_history") or []
+    if history:
+        history_lines = "\n".join(
+            f"  {e.get('date', '')[:10]}  {e.get('event', ''):<30}  ${e.get('price') or 0:,.0f}"
+            for e in history
+        )
+    else:
+        history_lines = "  No listing history available"
 
-LEAD INFO:
-{json.dumps({k: v for k, v in lead.items() if v}, indent=2)}
+    prompt = f"""You are summarizing the listing history of a property for a real estate investment team.
 
-PROPERTY DATA (source: Zillow/Scrapeak):
-- Address: {prop.get("display_name", lead.get("address", "Unknown"))}
-- List Price: ${f"{price:,.0f}" if price else "N/A"} | Zestimate: ${f"{estimate:,.0f}" if estimate else "N/A"}
-- Beds/Baths/Sqft: {prop.get("beds") if prop.get("beds") is not None else "--"} bd / {prop.get("baths")} ba / {prop.get("sqft")} sqft
-- MLS Status: {prop.get("mls_status") if prop.get("mls_status", "").upper() not in ("", "OTHER") else "Off-market"}
-- Year Built: {prop.get("year_built", "N/A")}
-- Last Sold: {prop.get("last_sold_date", "N/A")} {"(within 36mo)" if prop.get("last_sold_within_36mo") else ""}  {("$" + f"{prop['last_sold_price']:,.0f}") if prop.get("last_sold_price") else ""}
-- Rental history: {"Yes — " + "; ".join(prop.get("rental_notes", [])) if prop.get("rental_history_detected") else "None detected"}
-- Zillow link: {prop.get("zillow_url", "N/A")}
-- Flags hit: {", ".join(flags_hit) if flags_hit else "None"}"""
+State only the facts from the listing history below — dates, prices, and events. No interpretation, no commentary, no conclusions. 2-3 sentences max. If there is no meaningful listing history, say so in one sentence.
+
+LISTING HISTORY (newest first):
+{history_lines}
+
+MLS Status: {prop.get("mls_status") if prop.get("mls_status", "").upper() not in ("", "OTHER") else "Off-market"}
+Rental history: {"Yes — " + "; ".join(prop.get("rental_notes", [])) if prop.get("rental_history_detected") else "None detected"}"""
 
     response = claude.messages.create(
         model="claude-opus-4-6",
@@ -532,16 +687,22 @@ FLAG_EMOJI = {
     "listing_photos_available": "📸",
     "sold_within_36_months":    "🔄",
     "listed_or_expired_36mo":   "📅",
+    "newer_build":              "🏗",
+    "low_equity":               "📉",
+    "high_equity":              "📈",
     "unknown_bed_count":        "❓",
 }
 
 FLAG_LABEL = {
     "active_mls_listing":       "Active MLS listing",
-    "value_at_or_above_500k":   f"Value ≥ ${MIN_VALUE_THRESHOLD:,}",
+    "value_at_or_above_500k":   f"Value >= ${MIN_VALUE_THRESHOLD:,}",
     "rental_history":           "Rental history detected",
     "listing_photos_available": "Listing photos available",
     "sold_within_36_months":    "Sold within last 36 months",
     "listed_or_expired_36mo":   "Listed/expired in last 36 months",
+    "newer_build":              "Newer build (1990+)",
+    "low_equity":               "Low equity (sold price within 20% of Zestimate)",
+    "high_equity":              "High equity (purchased at <=50% of current value)",
     "unknown_bed_count":        "Unknown bed count (Zillow shows --)",
 }
 
@@ -558,77 +719,100 @@ def send_slack(lead: dict, prop: dict, analysis: dict, zillow_link: str):
     flags       = analysis["flags"]
     total_flags = len(flags)
 
-    # ── Compact property detail lines ──────────────────────────────────────
-    detail_lines = [f"*📍 {address}*"]
+    # ── Build detail section (property info + flags all together) ──────────
+    lsp   = prop.get("last_sold_price")
+    zest  = prop.get("zestimate")
+    photo_count = prop.get("photo_count") or 0
 
-    # Beds / baths / sqft on one line
-    beds  = prop.get("beds")
-    baths = prop.get("baths")
-    sqft  = prop.get("sqft")
+    # Owner name + address line with Zestimate inline
+    detail_lines = [f"*{name}*"]
+    addr_line = f"*📍 {address}*"
+    if zest:
+        addr_line += f"  •  Zestimate: *${zest:,.0f}*"
+    detail_lines.append(addr_line)
+
+    # Beds / baths / sqft / lot / year
+    beds       = prop.get("beds")
+    baths      = prop.get("baths")
+    sqft       = prop.get("sqft")
+    year_built = prop.get("year_built")
+    lot_size   = prop.get("lot_size")
     parts = []
     parts.append(f"{int(beds)} bd" if beds is not None else "-- bd")
     parts.append(f"{baths:.1g} ba" if baths is not None else "-- ba")
-    if sqft:
-        parts.append(f"{int(sqft):,} sqft")
-    year_built = prop.get("year_built")
-    if year_built:
-        parts.append(f"built {int(year_built)}")
-    detail_lines.append("🛏 " + "  /  ".join(parts))
+    if sqft:     parts.append(f"{int(sqft):,} sqft")
+    if lot_size: parts.append(f"lot {lot_size}")
+    if year_built: parts.append(f"built {int(year_built)}")
+    detail_lines.append("🏡 " + "  /  ".join(parts))
 
-    # Last sold
-    if prop.get("last_sold_date"):
-        sold = f"🔄 Last sold: {prop['last_sold_date']}"
-        if prop.get("last_sold_price"):
-            sold += f"  •  ${prop['last_sold_price']:,.0f}"
-        if prop.get("last_sold_within_36mo"):
-            sold += "  ⚠️ within 36mo"
-        detail_lines.append(sold)
+    # Garage / basement
+    extra = []
+    if prop.get("garage"):   extra.append(prop["garage"])
+    if prop.get("basement"): extra.append(f"Basement: {prop['basement']}")
+    if extra:
+        detail_lines.append("🔑 " + "  •  ".join(extra))
 
-    # MLS status (only when meaningful)
+    # MLS status
     mls = prop.get("mls_status")
     if mls and mls.upper() not in ("", "OTHER", "NOT LISTED"):
         detail_lines.append(f"🏷 {mls}")
 
+    # Last sold
+    if prop.get("last_sold_date"):
+        sold = f"🔄 Last sold: {prop['last_sold_date']}"
+        if lsp:
+            sold += f"  •  ${lsp:,.0f}"
+        if prop.get("last_sold_within_36mo"):
+            sold += "  ⚠️ within 36mo"
+        detail_lines.append(sold)
+
+    # Equity lines
+    if lsp and zest and zest > 0:
+        pct = int((zest - lsp) / zest * 100)
+        if pct >= 50:
+            detail_lines.append(f"📈 Purchased at {100 - pct}% of current value")
+        elif abs(pct) <= 20:
+            detail_lines.append(f"📉 Low equity — paid ${lsp:,.0f}, Zestimate ${zest:,.0f}")
+
+    # Flags folded in
+    for k, v in flags.items():
+        if not v:
+            continue
+        if k in ("listing_photos_available", "low_equity", "high_equity", "newer_build"):
+            continue  # handled separately or silently triggers only
+        detail_lines.append(f"• {FLAG_LABEL.get(k, k)}")
+
+    # Photos link
+    if photo_count > 1 and zillow_link:
+        detail_lines.append(f"📸 <{zillow_link}|{photo_count} photos on Zillow>")
+
     detail_text = "\n".join(detail_lines)
 
-    # ── Flags (only fired ones) + photo link ──────────────────────────────
-    photo_count = prop.get("photo_count") or 0
-    flag_lines = [
-        f"✅ {FLAG_EMOJI.get(k, '•')} {FLAG_LABEL.get(k, k)}"
-        for k, v in flags.items() if v
-    ]
-    if photo_count > 1 and zillow_link:
-        flag_lines.append(f"📸 <{zillow_link}|{photo_count} photos on Zillow>")
-    flag_block = "\n".join(flag_lines) if flag_lines else "_No flags hit_"
-
+    photo_url = prop.get("photo_url", "")
     blocks = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text",
-                     "text": f"🏠 {name}",
-                     "emoji": True}
-        },
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn",
-                          "text": f"{source}  •  {datetime.now().strftime('%b %d, %Y %I:%M %p')}"}]
-        },
         {"type": "divider"},
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": detail_text}
         },
         {"type": "divider"},
-        {
+    ]
+
+    if photo_url:
+        blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": flag_block}
-        },
-        {"type": "divider"},
-        {
+            "text": {"type": "mrkdwn", "text": analysis["text"]},
+            "accessory": {
+                "type": "image",
+                "image_url": photo_url,
+                "alt_text": address,
+            },
+        })
+    else:
+        blocks.append({
             "type": "section",
             "text": {"type": "mrkdwn", "text": analysis["text"]}
-        },
-    ]
+        })
 
     if lead.get("message"):
         blocks.append({
@@ -674,8 +858,27 @@ def process_lead(lead: dict):
     if not address:
         return
 
+    # ── 0. Duplicate check (address only — zpid checked again after lookup) ─
+    existing = is_duplicate(address)
+    if existing:
+        log.info(
+            "Duplicate lead skipped — already processed %s on %s (flags: %s)",
+            address, existing["processed_at"], existing["flags_hit"]
+        )
+        return
+
     # ── 1. Try Zillow first (direct property match + Zestimate) ────────────
     prop = zillow_lookup(address)
+
+    # ── 1b. Dedup check by zpid now that we have it ────────────────────────
+    if prop.get("zpid"):
+        existing = is_duplicate(address, zpid=prop["zpid"])
+        if existing:
+            log.info(
+                "Duplicate lead skipped (zpid %s) — already processed %s on %s",
+                prop["zpid"], address, existing["processed_at"]
+            )
+            return
 
     # ── 2. Fill in gaps with Redfin GIS (active listings / recent sales) ───
     if not prop.get("zpid"):
@@ -719,12 +922,17 @@ def process_lead(lead: dict):
 
     if analysis["flag_count"] == 0:
         log.info("No flags — skipping Slack for %s", address)
+        record_lead(lead, prop, analysis, slack_sent=False)
         return
 
+    slack_ok = False
     try:
         send_slack(lead, prop, analysis, zlink)
+        slack_ok = True
     except Exception as exc:
         log.error("Slack error: %s", exc)
+
+    record_lead(lead, prop, analysis, slack_sent=slack_ok)
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +945,21 @@ app = FastAPI(title="Lead Review Bot", version="2.0")
 @app.get("/health")
 def health():
     return {"status": "ok", "threshold": MIN_VALUE_THRESHOLD}
+
+
+@app.get("/api/leads")
+def api_leads(limit: int = 50, slack_sent: int = None, min_flags: int = 0):
+    """Query processed leads from the database."""
+    query  = "SELECT * FROM leads WHERE flag_count >= ?"
+    params = [min_flags]
+    if slack_sent is not None:
+        query  += " AND slack_sent = ?"
+        params.append(slack_sent)
+    query += " ORDER BY processed_at DESC LIMIT ?"
+    params.append(limit)
+    with _db() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 @app.post("/webhook/lead")

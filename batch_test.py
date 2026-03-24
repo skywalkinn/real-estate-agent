@@ -26,7 +26,7 @@ from datetime import datetime
 
 # Load env before importing lead_bot
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 # Patch out Slack if dry run (set before import so the module sees it)
 _original_slack_url = os.getenv("SLACK_WEBHOOK_URL", "")
@@ -34,9 +34,11 @@ _original_slack_url = os.getenv("SLACK_WEBHOOK_URL", "")
 import lead_bot
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
 from rich import box
 
-console = Console()
+console = Console(legacy_windows=False)
 
 
 def run_batch(csv_path: str, send_to_slack: bool = False, limit: int = None, args_random: int = None):
@@ -137,13 +139,83 @@ def run_batch(csv_path: str, send_to_slack: bool = False, limit: int = None, arg
         if flag_count == 0:
             console.print("[dim]0 flags — skip[/dim]")
         else:
-            console.print(f"[green]{flag_count}/7 flags:[/green] {', '.join(flags_hit)}")
+            console.print(f"[green]{flag_count}/9 flags:[/green] {', '.join(flags_hit)}")
+
+            # ── Rich preview card (mirrors Slack layout) ──────────────────
+            card_lines = Text()
+
+            # Header: name + source/date
+            card_lines.append(f"  {name}\n", style="bold white")
+            src  = lead.get("source", "CRM")
+            date = lead.get("date", "")
+            card_lines.append(f"  {src}  |  {date}\n", style="dim")
+            card_lines.append("  " + "-" * 46 + "\n", style="dim")
+
+            # Address + beds/baths/sqft
+            disp_addr = lead.get("address") or prop.get("display_name", "Unknown")
+            card_lines.append(f"  ADDR   {disp_addr}\n", style="bold cyan")
+
+            beds  = prop.get("beds")
+            baths = prop.get("baths")
+            sqft  = prop.get("sqft")
+            yr    = prop.get("year_built")
+            parts = []
+            parts.append(f"{int(beds)} bd" if beds is not None else "-- bd")
+            parts.append(f"{baths:.1g} ba" if baths is not None else "-- ba")
+            if sqft:  parts.append(f"{int(sqft):,} sqft")
+            if yr:    parts.append(f"built {int(yr)}")
+            card_lines.append("  BED    " + "  /  ".join(parts) + "\n")
+
+            # Last sold
+            if prop.get("last_sold_date"):
+                sold_line = f"  SOLD   {prop['last_sold_date']}"
+                if prop.get("last_sold_price"):
+                    sold_line += f"  |  ${prop['last_sold_price']:,.0f}"
+                if prop.get("last_sold_within_36mo"):
+                    sold_line += "  [!] within 36mo"
+                card_lines.append(sold_line + "\n")
+
+            # Zestimate
+            zest = prop.get("zestimate")
+            if zest:
+                card_lines.append(f"  EST    ${zest:,.0f}\n")
+
+            # MLS status
+            mls = prop.get("mls_status") or ""
+            if mls.upper() not in ("", "OTHER", "NOT LISTED"):
+                card_lines.append(f"  MLS    {mls}\n")
+            else:
+                card_lines.append("  MLS    Off-market\n", style="dim")
+
+            card_lines.append("  " + "-" * 46 + "\n", style="dim")
+
+            # Flags
+            flags      = analysis["flags"]
+            flag_label = lead_bot.FLAG_LABEL
+            for k, v in flags.items():
+                if not v:
+                    continue
+                if k == "listing_photos_available" and not flags.get("active_mls_listing"):
+                    continue
+                card_lines.append(f"  [+] {flag_label.get(k, k)}\n", style="green")
+
+            photo_count = prop.get("photo_count") or 0
+            if photo_count > 1 and zlink:
+                card_lines.append(f"  [photos] {photo_count} photos -> {zlink}\n", style="cyan")
+
+            card_lines.append("  " + "-" * 46 + "\n", style="dim")
+
+            # Claude analysis
+            card_lines.append("  " + analysis["text"].replace("\n", "\n  "), style="italic")
+
+            console.print(Panel(card_lines, border_style="green", padding=(0, 1)))
+
             if send_to_slack:
                 try:
                     lead_bot.send_slack(lead, prop, analysis, zlink)
-                    console.print(f"  [cyan]→ Slack sent[/cyan]")
+                    console.print(f"  [cyan]>> Slack sent[/cyan]")
                 except Exception as exc:
-                    console.print(f"  [red]→ Slack error: {exc}[/red]")
+                    console.print(f"  [red]>> Slack error: {exc}[/red]")
 
         results.append({
             "name":       name,
