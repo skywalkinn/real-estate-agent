@@ -852,6 +852,18 @@ def send_slack(lead: dict, prop: dict, analysis: dict, zillow_link: str):
 # ---------------------------------------------------------------------------
 
 def process_lead(lead: dict):
+    # Normalize field names from various CRM/Zapier formats
+    if not lead.get("address"):
+        if lead.get("full_address"):
+            lead["address"] = lead["full_address"]
+        elif lead.get("address1"):
+            parts = [lead.get("address1", ""), lead.get("city", ""),
+                     lead.get("state", ""), lead.get("postal_code", "")]
+            lead["address"] = ", ".join(p for p in parts if p)
+    if not lead.get("name"):
+        lead["name"] = (lead.get("full_name") or
+                        f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip())
+
     address = lead.get("address", "")
     log.info("Processing lead — %s", address or "(no address)")
 
